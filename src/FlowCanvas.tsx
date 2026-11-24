@@ -38,6 +38,7 @@ export type FlowProps = {
   catalog: AudioCatalog
   selection: Selection
   topologyLocked: boolean
+  offline: readonly string[]
   meters: MeterStore
   onSelect: (selection: Selection) => void
   onConnect: (endpoints: Endpoints) => void
@@ -220,7 +221,7 @@ function toEndpoints(connection: Connection): Endpoints | null {
   }
 }
 
-export function FlowCanvas({ project, catalog, selection, topologyLocked, meters, onSelect, onConnect, onMove, onDelete }: FlowProps) {
+export function FlowCanvas({ project, catalog, selection, topologyLocked, offline, meters, onSelect, onConnect, onMove, onDelete }: FlowProps) {
   const [expanded, setExpanded] = useState<string[]>([])
   const [port, setPort] = useState<KeyPort | null>(null)
   const toggle = useCallback((id: string) => {
@@ -244,7 +245,7 @@ export function FlowCanvas({ project, catalog, selection, topologyLocked, meters
       selected: selection?.kind === 'node' && selection.id === node.id,
       data: {
         id: node.id, label: node.label, variant: variantFor(node.kind, catalog), hasInput: canTarget(node), hasOutput: canSource(node),
-        available: deviceAvailable(node, catalog), channels, visibleChannels, expanded: unfolded,
+        available: !offline.includes(node.id) && deviceAvailable(node, catalog), channels, visibleChannels, expanded: unfolded,
         isInterface: node.kind.type === 'deviceInput' || node.kind.type === 'deviceOutput',
         channelLabels: Object.fromEntries(visibleChannels.map((channel) => [channel, channelLabel(node, channel, catalog, project)])),
         connectedInputs, connectedOutputs,
@@ -252,7 +253,7 @@ export function FlowCanvas({ project, catalog, selection, topologyLocked, meters
         setExpanded: toggle,
       },
     }
-  }), [project, catalog, selection, expanded, toggle])
+  }), [project, catalog, selection, offline, expanded, toggle])
   const [nodes, setNodes] = useState(displayed)
   useEffect(() => {
     setNodes((current) => displayed.map((node) => {

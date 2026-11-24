@@ -43,33 +43,48 @@ unsafe extern "C" {
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
 
-pub(super) fn authorize_microphone() -> Result<()> {
+const MICROPHONE_NOT_DETERMINED: isize = 0;
+const MICROPHONE_AUTHORIZED: isize = 3;
+const MICROPHONE_PERMISSION_ERROR: &str =
+    "Autorise le microphone dans Réglages Système > Confidentialité et sécurité.";
+
+fn microphone_authorization_status() -> isize {
+    let device = class!(AVCaptureDevice);
+    // SAFETY: AVFoundation is linked above, and this selector takes its exported audio media type.
+    unsafe { msg_send![device, authorizationStatusForMediaType: AVMediaTypeAudio] }
+}
+
+pub(super) fn microphone_authorized() -> Result<()> {
     autoreleasepool(|_| {
+        if microphone_authorization_status() == MICROPHONE_AUTHORIZED {
+            Ok(())
+        } else {
+            Err(MICROPHONE_PERMISSION_ERROR.into())
+        }
+    })
+}
+
+pub(super) fn request_microphone() -> Result<()> {
+    autoreleasepool(|_| {
+        match microphone_authorization_status() {
+            MICROPHONE_AUTHORIZED => return Ok(()),
+            MICROPHONE_NOT_DETERMINED => {}
+            _ => return Err(MICROPHONE_PERMISSION_ERROR.into()),
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let completed = RcBlock::new(move |granted: Bool| {
+            let _ = sender.try_send(granted.as_bool());
+        });
         let device = class!(AVCaptureDevice);
-        // SAFETY: AVFoundation is linked above, and this selector takes its exported audio media type.
-        let status: isize =
-            unsafe { msg_send![device, authorizationStatusForMediaType: AVMediaTypeAudio] };
-        if status == 3 {
-            return Ok(());
+        // SAFETY: AVFoundation copies this block for async delivery. Its captured sender is Send.
+        let _: () = unsafe {
+            msg_send![device, requestAccessForMediaType: AVMediaTypeAudio, completionHandler: &*completed]
+        };
+        match receiver.recv_timeout(Duration::from_secs(120)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(MICROPHONE_PERMISSION_ERROR.into()),
+            Err(_) => Err("La demande d'accès au microphone n'a pas abouti.".into()),
         }
-        if status == 0 {
-            let (sender, receiver) = mpsc::sync_channel(1);
-            let completed = RcBlock::new(move |granted: Bool| {
-                let _ = sender.try_send(granted.as_bool());
-            });
-            // SAFETY: AVFoundation copies this block for async delivery. Its captured sender is Send.
-            let _: () = unsafe {
-                msg_send![device, requestAccessForMediaType: AVMediaTypeAudio, completionHandler: &*completed]
-            };
-            match receiver.recv_timeout(Duration::from_secs(120)) {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(_) => {
-                    return Err("La demande d'accès au microphone n'a pas abouti.".into());
-                }
-            }
-        }
-        Err("Autorise le microphone dans Réglages Système > Confidentialité et sécurité.".into())
     })
 }
 

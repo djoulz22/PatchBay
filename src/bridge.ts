@@ -29,6 +29,7 @@ export async function saveSession(session: Session): Promise<void> {
   localStorage.setItem(key, JSON.stringify(session))
 }
 
+export function authorizeAudioInput(): Promise<void> { return invoke('authorize_audio_input') }
 export function startRouting(project: Project): Promise<unknown> { return invoke('start_routing', { project }) }
 export function updateRouting(project: Project): Promise<unknown> { return invoke('update_routing', { project }) }
 export function stopRouting(): Promise<unknown> { return invoke('stop_routing') }

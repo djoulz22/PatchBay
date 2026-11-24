@@ -12,7 +12,10 @@
     "build": "vue-tsc --noEmit && vite build",
     "build:app": "tauri build --bundles app",
     "typecheck": "vue-tsc --noEmit",
-    "test": "cargo test --locked --manifest-path src-tauri/Cargo.toml",
+    "test": "corepack pnpm run test:web && corepack pnpm run test:rust && corepack pnpm run test:driver",
+    "test:web": "vitest run",
+    "test:rust": "cargo test --locked --manifest-path src-tauri/Cargo.toml",
+    "test:driver": "sh driver/test.sh",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -32,6 +35,7 @@
     "@vitejs/plugin-vue": "^6.0.0",
     "typescript": "~5.9.3",
     "vite": "^7.0.0",
+    "vitest": "^5.1.1",
     "vue-tsc": "^3.0.0"
   }
 }

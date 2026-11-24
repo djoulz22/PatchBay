@@ -208,6 +208,17 @@ pub(crate) fn devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>), String> 
     ))
 }
 
+pub(crate) fn device_rate(id: &str) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    return macos_tap::device_sample_rate(id);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
 pub fn enumerate() -> Result<AudioCatalog, String> {
     let (inputs, outputs) = devices()?;
     #[cfg(target_os = "macos")]
@@ -317,32 +328,44 @@ struct DeviceStream {
     direction: Direction,
 }
 
+pub(crate) struct StreamFault {
+    pub message: String,
+    pub restart_required: bool,
+}
+
 impl DeviceStream {
-    fn error(&self) -> Option<String> {
+    fn error(&self) -> Option<StreamFault> {
         #[cfg(target_os = "macos")]
-        match macos_tap::device_sample_rate(&self.info.id) {
+        match device_rate(&self.info.id) {
             Some(rate) if rate != self.info.sample_rate => {
-                return Some(format!(
-                    "{} : la fréquence de {} a changé.",
-                    self.direction.label(),
-                    self.info.name
-                ));
+                return Some(StreamFault {
+                    message: format!(
+                        "{} : la fréquence de {} a changé.",
+                        self.direction.label(),
+                        self.info.name
+                    ),
+                    restart_required: true,
+                });
             }
             None => {
-                return Some(format!(
-                    "{} déconnectée : {}",
-                    self.direction.label(),
-                    self.info.name
-                ));
+                return Some(StreamFault {
+                    message: format!(
+                        "{} déconnectée : {}",
+                        self.direction.label(),
+                        self.info.name
+                    ),
+                    restart_required: false,
+                });
             }
             _ => {}
         }
-        self.failed.load(Ordering::Acquire).then(|| {
-            format!(
+        self.failed.load(Ordering::Acquire).then(|| StreamFault {
+            message: format!(
                 "{} interrompue : {}",
                 self.direction.label(),
                 self.info.name
-            )
+            ),
+            restart_required: false,
         })
     }
 }
@@ -381,12 +404,15 @@ impl AudioInput {
         frame.len() >= self.channels() && self.queue.pop(|channel, sample| frame[channel] = sample)
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub(crate) fn error(&self) -> Option<StreamFault> {
         match &self.stream {
             InputStream::Device(device) => device.error(),
             InputStream::Browser => None,
             #[cfg(target_os = "macos")]
-            InputStream::Tap(tap) => tap.check_alive().err(),
+            InputStream::Tap(tap) => tap.check_alive().err().map(|message| StreamFault {
+                message,
+                restart_required: false,
+            }),
         }
     }
 }
@@ -414,9 +440,25 @@ impl AudioOutput {
         frame.len() >= self.channels() && self.queue.push(|channel| frame[channel])
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub(crate) fn error(&self) -> Option<StreamFault> {
         self.stream.error()
     }
+}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<AudioInput>();
+    assert_send::<AudioOutput>();
+};
+
+#[cfg(target_os = "macos")]
+pub fn request_microphone() -> Result<(), String> {
+    macos_tap::request_microphone()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_microphone() -> Result<(), String> {
+    Ok(())
 }
 
 pub fn open_input(
@@ -426,12 +468,11 @@ pub fn open_input(
 ) -> Result<AudioInput, String> {
     match source {
         NodeKind::DeviceInput { device_id } => {
+            // macOS applies Microphone privacy to HAL inputs, including BlackHole.
+            #[cfg(target_os = "macos")]
+            macos_tap::microphone_authorized()?;
             let direction = Direction::Input;
             let (device, info, config) = find_device(device_id, direction, requested_rate)?;
-            #[cfg(target_os = "macos")]
-            // macOS applies Microphone privacy to HAL inputs, including BlackHole.
-            macos_tap::authorize_microphone()
-                .map_err(|error| format!("{} : {error}", info.name))?;
             let queue = FrameQueue::new(info.channels);
             let failed = Arc::new(AtomicBool::new(false));
             let stream = build_input(&device, &config, &queue, &failed)

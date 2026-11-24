@@ -9,20 +9,30 @@ use serde::Serialize;
 use crate::audio::{self, AudioInput, AudioOutput};
 use crate::browser_audio::BrowserCapture;
 use crate::graph::{
-    ChannelLevel, GraphNode, NodeKind, Project, Route, canonical_device_id, master_pan, master_side,
+    ChannelLevel, GraphNode, MAX_CHANNELS, NodeKind, Project, Route, canonical_device_id,
+    master_pan, master_side,
 };
+use crate::realtime;
+
+mod recovery;
+use recovery::{Attempt, EndpointSpec, Recovery, RecoveryReply, RecoveryRequest};
 
 const BLOCKS_PER_SECOND: usize = 200;
 const BLOCK_TIME: Duration = Duration::from_millis(1_000 / BLOCKS_PER_SECOND as u64);
+const MIX_COMPUTATION_TIME: Duration = Duration::from_micros(1_500);
 const HEALTH_INTERVAL: Duration = Duration::from_millis(250);
 const METER_INTERVAL: Duration = Duration::from_millis(50);
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+const OUTPUT_LOSS_TIMEOUT: Duration = Duration::from_secs(10);
 const TONE_LEVEL: f32 = 0.125;
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
     pub running: bool,
+    pub realtime: bool,
     pub error: Option<String>,
+    pub offline: Vec<String>,
     pub meters: BTreeMap<String, Meter>,
     pub underruns: u64,
     pub dropped_frames: u64,
@@ -57,6 +67,7 @@ impl Meter {
 
     fn observe_master(&mut self, frame: [f32; 2]) {
         let master = self.master.get_or_insert_default();
+        let mut overload = false;
         for ((peak, clipped), sample) in master
             .channels
             .iter_mut()
@@ -64,9 +75,12 @@ impl Meter {
             .zip(frame)
         {
             let level = sample.abs();
-            *clipped |= level > 1.0;
+            let channel_overload = level > 1.0;
+            *clipped |= channel_overload;
+            overload |= channel_overload;
             *peak = peak.max(level.min(1.0));
         }
+        self.clipping |= overload;
     }
 
     fn observe(&mut self, frame: &[f32]) {
@@ -135,15 +149,34 @@ impl Runtime {
                         return;
                     }
                 };
-                worker_status.lock().expect("audio status lock").running = true;
+                let recovery = match Recovery::start(plan.sample_rate, browser) {
+                    Ok(recovery) => recovery,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let promoted = realtime::promote_current_thread(BLOCK_TIME, MIX_COMPUTATION_TIME);
+                {
+                    let mut status = worker_status.lock().expect("audio status lock");
+                    status.realtime = cfg!(target_os = "macos") && promoted.is_ok();
+                    status.running = true;
+                }
                 if ready_tx.send(Ok(virtual_devices)).is_err() {
                     return;
                 }
-                let result = plan.run(&worker_stop, &worker_status, &worker_pending_gains);
+                let result = plan.run(
+                    &worker_stop,
+                    &worker_status,
+                    &worker_pending_gains,
+                    &recovery,
+                );
                 let mut status = worker_status.lock().expect("audio status lock");
                 status.running = false;
+                status.realtime = false;
                 status.error = result.err();
                 status.meters.clear();
+                status.offline.clear();
             })
             .map_err(|error| format!("Démarrage du moteur audio impossible. {error}"))?;
         let mut runtime = Self {
@@ -164,8 +197,10 @@ impl Runtime {
         let mut status = self.status.lock().expect("audio status lock").clone();
         if status.running && self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
             status.running = false;
+            status.realtime = false;
             status.error = Some("Le moteur audio s'est interrompu.".into());
             status.meters.clear();
+            status.offline.clear();
         }
         status
     }
@@ -350,6 +385,7 @@ impl RenderPlan {
         stop: &AtomicBool,
         status: &Mutex<EngineStatus>,
         pending_gains: &Mutex<Option<MixLevels>>,
+        recovery: &Recovery,
     ) -> Result<(), String> {
         for destination in &mut self.destinations {
             destination.prime();
@@ -370,12 +406,21 @@ impl RenderPlan {
                 next_tick = now;
             }
             next_tick += BLOCK_TIME;
+            self.apply_recovery_replies(now, recovery);
             if let Some(gains) = pending_gains.lock().expect("audio gains lock").take() {
                 self.mixer.set_gains(gains, self.sample_rate / 100);
             }
             self.render(clock.next_frames());
             if now >= next_health {
-                self.check_streams()?;
+                self.check_streams(now, recovery);
+                if all_outputs_lost(
+                    self.destinations
+                        .iter()
+                        .map(|output| output.offline.as_ref().map(|offline| offline.since)),
+                    now,
+                ) {
+                    return Err("Toutes les sorties du graphe sont indisponibles.".into());
+                }
                 next_health = now + HEALTH_INTERVAL;
             }
             if now >= next_meter {
@@ -411,20 +456,66 @@ impl RenderPlan {
         }
     }
 
-    fn check_streams(&self) -> Result<(), String> {
-        for source in &self.sources {
+    fn check_streams(&mut self, now: Instant, recovery: &Recovery) {
+        for (index, source) in self.sources.iter_mut().enumerate() {
             if let SourceSignal::Capture(capture) = &source.signal
                 && let Some(error) = capture.stream.error()
             {
-                return Err(format!("{} ({error})", source.label));
+                let offline = Offline::new(now, capture.stream.sample_rate(), error);
+                let SourceSignal::Capture(capture) =
+                    std::mem::replace(&mut source.signal, SourceSignal::Offline(offline))
+                else {
+                    unreachable!("source fault can only come from a capture");
+                };
+                recovery.send(RecoveryRequest::RetireCapture(capture));
+            }
+            if let SourceSignal::Offline(offline) = &mut source.signal
+                && offline.recovery_due(now)
+            {
+                let endpoint = EndpointSpec::new(&source.node, offline, source.frame.len());
+                offline.request(now, recovery, RecoveryRequest::Capture(index, endpoint));
             }
         }
-        for destination in &self.destinations {
-            if let Some(error) = destination.stream.error() {
-                return Err(format!("{} ({error})", destination.label));
+        for (index, destination) in self.destinations.iter_mut().enumerate() {
+            if let Some(stream) = &destination.stream
+                && let Some(error) = stream.error()
+            {
+                destination.offline = Some(Offline::new(now, stream.sample_rate(), error));
+                if let Some(stream) = destination.stream.take() {
+                    recovery.send(RecoveryRequest::RetireOutput(stream));
+                }
+            }
+            if let Some(offline) = &mut destination.offline
+                && offline.recovery_due(now)
+            {
+                let endpoint =
+                    EndpointSpec::new(&destination.node, offline, destination.frame.len());
+                offline.request(now, recovery, RecoveryRequest::Output(index, endpoint));
             }
         }
-        Ok(())
+    }
+
+    fn apply_recovery_replies(&mut self, now: Instant, recovery: &Recovery) {
+        while let Some(reply) = recovery.try_recv() {
+            match reply {
+                RecoveryReply::Capture(index, attempt) => {
+                    let source = &mut self.sources[index];
+                    if let SourceSignal::Offline(offline) = &mut source.signal
+                        && let Some(capture) = offline.finish(now, attempt)
+                    {
+                        source.signal = SourceSignal::Capture(capture);
+                    }
+                }
+                RecoveryReply::Output(index, attempt) => {
+                    let destination = &mut self.destinations[index];
+                    if let Some(offline) = &mut destination.offline
+                        && let Some(stream) = offline.finish(now, attempt)
+                    {
+                        destination.restore(stream);
+                    }
+                }
+            }
+        }
     }
 
     fn report(&mut self, status: &Mutex<EngineStatus>) {
@@ -447,14 +538,107 @@ impl RenderPlan {
             destination
                 .meter
                 .report(&destination.id, &mut status.meters);
-            status.underruns = status.underruns.saturating_add(
-                destination
-                    .stream
-                    .underruns()
-                    .saturating_sub(destination.initial_underruns),
-            );
-            status.dropped_frames = status.dropped_frames.saturating_add(destination.dropped);
+            if let Some(stream) = &destination.stream {
+                status.underruns = status.underruns.saturating_add(
+                    stream
+                        .underruns()
+                        .saturating_sub(destination.initial_underruns),
+                );
+                status.dropped_frames = status.dropped_frames.saturating_add(destination.dropped);
+            }
         }
+        let offline_sources = self.sources.iter().filter_map(|source| {
+            if let SourceSignal::Offline(offline) = &source.signal {
+                Some((&source.id, offline))
+            } else {
+                None
+            }
+        });
+        let offline_outputs = self.destinations.iter().filter_map(|destination| {
+            destination
+                .offline
+                .as_ref()
+                .map(|offline| (&destination.id, offline))
+        });
+        status.offline.clear();
+        let mut latest: Option<&Offline> = None;
+        for (id, offline) in offline_sources.chain(offline_outputs) {
+            status.offline.push(id.clone());
+            if latest.is_none_or(|previous| previous.since <= offline.since) {
+                latest = Some(offline);
+            }
+        }
+        status.offline.sort_unstable();
+        status.error = latest.map(Offline::message);
+    }
+}
+
+fn all_outputs_lost(outputs: impl IntoIterator<Item = Option<Instant>>, now: Instant) -> bool {
+    let mut has_outputs = false;
+    for since in outputs {
+        has_outputs = true;
+        if since.is_none_or(|since| now.duration_since(since) < OUTPUT_LOSS_TIMEOUT) {
+            return false;
+        }
+    }
+    has_outputs
+}
+
+struct Offline {
+    since: Instant,
+    last_attempt: Instant,
+    sample_rate: u32,
+    reason: String,
+    restart_required: bool,
+    in_flight: bool,
+}
+
+impl Offline {
+    fn new(now: Instant, sample_rate: u32, error: audio::StreamFault) -> Self {
+        Self {
+            since: now,
+            last_attempt: now,
+            sample_rate,
+            reason: error.message,
+            restart_required: error.restart_required,
+            in_flight: false,
+        }
+    }
+
+    fn recovery_due(&self, now: Instant) -> bool {
+        !self.restart_required
+            && !self.in_flight
+            && now.duration_since(self.last_attempt) >= RECOVERY_INTERVAL
+    }
+
+    fn request(&mut self, now: Instant, recovery: &Recovery, request: RecoveryRequest) {
+        self.last_attempt = now;
+        self.in_flight = recovery.send(request);
+    }
+
+    fn finish<T>(&mut self, now: Instant, attempt: Attempt<T>) -> Option<T> {
+        self.in_flight = false;
+        // A queued request may have waited behind a slow native open. Start the next
+        // interval here so that such a delay cannot cause back-to-back attempts.
+        self.last_attempt = now;
+        match attempt {
+            Attempt::Open(stream) => Some(stream),
+            Attempt::Retry => None,
+            Attempt::RestartRequired(reason) => {
+                self.reason = reason;
+                self.restart_required = true;
+                None
+            }
+        }
+    }
+
+    fn message(&self) -> String {
+        let action = if self.restart_required {
+            "Redémarre le routage."
+        } else {
+            "Reprise automatique en attente."
+        };
+        format!("{}. {action}", self.reason.trim_end_matches('.'))
     }
 }
 
@@ -782,6 +966,7 @@ impl GainRamp {
 struct Source {
     id: String,
     label: String,
+    node: GraphNode,
     signal: SourceSignal,
     frame: Vec<f32>,
     meter: Meter,
@@ -790,6 +975,7 @@ struct Source {
 enum SourceSignal {
     Tone { phase: f64, increment: f64 },
     Capture(Box<Capture>),
+    Offline(Offline),
 }
 
 impl Source {
@@ -815,6 +1001,7 @@ impl Source {
         Ok(Self {
             id: node.id.clone(),
             label: node.label.clone(),
+            node: node.clone(),
             signal,
             frame: vec![0.0; channels],
             meter: Meter::new(channels),
@@ -837,6 +1024,7 @@ impl Source {
                 }
             }
             SourceSignal::Capture(capture) => capture.read(&mut self.frame),
+            SourceSignal::Offline(_) => self.frame.fill(0.0),
         }
         for sample in &mut self.frame {
             if !sample.is_finite() {
@@ -940,7 +1128,9 @@ impl Capture {
 struct Destination {
     id: String,
     label: String,
-    stream: AudioOutput,
+    node: GraphNode,
+    stream: Option<AudioOutput>,
+    offline: Option<Offline>,
     frame: Vec<f32>,
     previous: Vec<f32>,
     converted: Vec<f32>,
@@ -961,7 +1151,9 @@ impl Destination {
         Ok(Self {
             id: node.id.clone(),
             label: node.label.clone(),
-            stream,
+            node: node.clone(),
+            stream: Some(stream),
+            offline: None,
             frame: vec![0.0; channels],
             previous: vec![0.0; channels],
             converted: vec![0.0; channels],
@@ -975,24 +1167,38 @@ impl Destination {
     }
 
     fn prime(&mut self) {
-        let lead = (self.stream.sample_rate() as usize / 40).clamp(64, 1_600);
-        for _ in 0..lead {
-            if !self.stream.push_frame(&self.frame) {
-                break;
-            }
+        if let Some(stream) = &self.stream {
+            prime_output(stream);
+            self.initial_underruns = stream.underruns();
         }
-        self.initial_underruns = self.stream.underruns();
+    }
+
+    fn restore(&mut self, stream: AudioOutput) {
+        self.frame.fill(0.0);
+        self.previous.fill(0.0);
+        self.converted.fill(0.0);
+        self.phase = 0.0;
+        self.clock = ClockRecovery::default();
+        self.dropped = 0;
+        self.initial_underruns = stream.underruns();
+        self.stream = Some(stream);
+        self.offline = None;
     }
 
     fn begin_block(&mut self, engine_rate: u32) {
-        let sample_rate = self.stream.sample_rate();
-        let target = (sample_rate as usize / 50).clamp(32, 1_250);
-        self.step = f64::from(engine_rate) / f64::from(sample_rate)
-            * self.clock.update(self.stream.queued_frames(), target);
+        if let Some(stream) = &self.stream {
+            let sample_rate = stream.sample_rate();
+            let target = (sample_rate as usize / 50).clamp(32, 1_250);
+            self.step = f64::from(engine_rate) / f64::from(sample_rate)
+                * self.clock.update(stream.queued_frames(), target);
+        }
     }
 
     fn write_frame(&mut self) {
         self.meter.observe(&self.frame);
+        let Some(stream) = &self.stream else {
+            return;
+        };
         for sample in &mut self.frame {
             *sample = sample.clamp(-1.0, 1.0);
         }
@@ -1003,13 +1209,23 @@ impl Destination {
                 self.phase as f32,
                 &mut self.converted,
             );
-            if !self.stream.push_frame(&self.converted) {
+            if !stream.push_frame(&self.converted) {
                 self.dropped += 1;
             }
             self.phase += self.step;
         }
         self.phase -= 1.0;
         self.previous.copy_from_slice(&self.frame);
+    }
+}
+
+fn prime_output(stream: &AudioOutput) {
+    let lead = (stream.sample_rate() as usize / 40).clamp(64, 1_600);
+    let silence = [0.0; MAX_CHANNELS];
+    for _ in 0..lead {
+        if !stream.push_frame(&silence) {
+            break;
+        }
     }
 }
 
@@ -1022,6 +1238,119 @@ fn interpolate(previous: &[f32], next: &[f32], fraction: f32, output: &mut [f32]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_outage(since: Instant, message: &str) -> Offline {
+        Offline::new(
+            since,
+            48_000,
+            audio::StreamFault {
+                message: message.into(),
+                restart_required: false,
+            },
+        )
+    }
+
+    #[test]
+    fn recovery_waits_one_second_and_never_retries_a_pending_request() {
+        let now = Instant::now();
+        let mut outage = sample_outage(now, "Micro USB déconnecté");
+        assert!(!outage.recovery_due(now + Duration::from_millis(999)));
+        assert!(outage.recovery_due(now + RECOVERY_INTERVAL));
+        outage.in_flight = true;
+        assert!(!outage.recovery_due(now + RECOVERY_INTERVAL * 4));
+        let completed = now + RECOVERY_INTERVAL * 5;
+        assert!(outage.finish::<()>(completed, Attempt::Retry).is_none());
+        assert!(!outage.recovery_due(completed + Duration::from_millis(999)));
+        assert!(outage.recovery_due(completed + RECOVERY_INTERVAL));
+        assert!(
+            outage
+                .finish::<()>(
+                    completed,
+                    Attempt::RestartRequired("La fréquence du micro a changé.".into())
+                )
+                .is_none()
+        );
+        assert!(!outage.recovery_due(completed + RECOVERY_INTERVAL * 4));
+        assert_eq!(
+            outage.message(),
+            "La fréquence du micro a changé. Redémarre le routage."
+        );
+    }
+
+    #[test]
+    fn output_timeout_requires_a_continuous_outage_of_every_output() {
+        let first = Instant::now();
+        let last = first + Duration::from_secs(2);
+        let deadline = last + OUTPUT_LOSS_TIMEOUT;
+        assert!(!all_outputs_lost([], deadline));
+        assert!(!all_outputs_lost([Some(first), None], deadline));
+        assert!(!all_outputs_lost(
+            [Some(first), Some(last)],
+            deadline - Duration::from_millis(1)
+        ));
+        assert!(all_outputs_lost([Some(first), Some(last)], deadline));
+    }
+
+    #[test]
+    fn an_offline_source_is_silent_and_preserves_other_mix_signals() {
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "sampleRate": 48000,
+            "nodes": [
+                { "id": "z", "label": "USB", "x": 0, "y": 0,
+                    "kind": { "type": "tone", "frequencyHz": 1000 } },
+                { "id": "a", "label": "Application", "x": 0, "y": 100,
+                    "kind": { "type": "tone", "frequencyHz": 1000 } },
+                { "id": "tone", "label": "Tonalité", "x": 0, "y": 200,
+                    "kind": { "type": "tone", "frequencyHz": 1000 } },
+                { "id": "bus", "label": "Bus", "x": 200, "y": 0,
+                    "kind": { "type": "internalBus", "channels": 1 } }
+            ],
+            "routes": [
+                { "id": "usb", "source": "z", "target": "bus", "sourceChannel": 0,
+                    "targetChannel": 0, "gain": 1.0, "muted": false },
+                { "id": "application", "source": "a", "target": "bus", "sourceChannel": 0,
+                    "targetChannel": 0, "gain": 1.0, "muted": false },
+                { "id": "keep", "source": "tone", "target": "bus", "sourceChannel": 0,
+                    "targetChannel": 0, "gain": 1.0, "muted": false }
+            ]
+        }))
+        .unwrap();
+        let (mut plan, _) = RenderPlan::open(&project, &BrowserCapture::default()).unwrap();
+        let now = Instant::now();
+        let usb = std::mem::replace(
+            &mut plan.sources[0].signal,
+            SourceSignal::Offline(sample_outage(now, "Micro USB déconnecté")),
+        );
+        let app = std::mem::replace(
+            &mut plan.sources[1].signal,
+            SourceSignal::Offline(sample_outage(
+                now + RECOVERY_INTERVAL,
+                "Capture interrompue",
+            )),
+        );
+        plan.sources[0].frame.fill(1.0);
+        plan.sources[1].frame.fill(1.0);
+        plan.render(240);
+        let status = Mutex::new(EngineStatus::default());
+        plan.report(&status);
+        {
+            let status = status.lock().unwrap();
+            assert_eq!(status.meters["z"].channels, [0.0]);
+            assert_eq!(status.meters["a"].channels, [0.0]);
+            assert_eq!(status.meters["bus"].channels, [TONE_LEVEL]);
+            assert_eq!(status.offline, ["a", "z"]);
+            assert_eq!(
+                status.error.as_deref(),
+                Some("Capture interrompue. Reprise automatique en attente.")
+            );
+        }
+        plan.sources[0].signal = usb;
+        plan.sources[1].signal = app;
+        plan.report(&status);
+        let status = status.into_inner().unwrap();
+        assert!(status.offline.is_empty());
+        assert!(status.error.is_none());
+    }
 
     #[test]
     fn block_clock_has_no_rounding_drift_at_44100() {
@@ -1281,6 +1610,23 @@ mod tests {
     }
 
     #[test]
+    fn master_only_clipping_sets_global_meter_without_clipping_tracks() {
+        let mut output = OutputStage::new(OutputMix::new(3, &[], &[[0, 1]], None));
+        let mut frame = [0.875, -0.125, 0.5];
+        let mut meter = Meter::new(frame.len());
+
+        output.finish_frame(&mut frame, &mut meter);
+
+        assert_eq!(frame, [0.875, -0.125, 0.5]);
+        assert_eq!(meter.clipped_channels, [false; 3]);
+        assert_eq!(
+            meter.master.as_ref().unwrap().clipped_channels,
+            [true, false]
+        );
+        assert!(meter.clipping);
+    }
+
+    #[test]
     fn chained_buses_deliver_impulses_on_the_same_frame_as_a_direct_send() {
         use crate::graph::{MASTER_LEFT_CHANNEL, MASTER_RIGHT_CHANNEL};
 
@@ -1408,6 +1754,16 @@ mod tests {
         let status = status.into_inner().unwrap();
         assert_eq!(status.meters["bus"].channels, [0.0, TONE_LEVEL]);
         assert_eq!(status.dropped_frames, 0);
+
+        let runtime = Runtime::start(project, BrowserCapture::default()).unwrap();
+        let status = runtime.status();
+        assert!(status.running);
+        assert_eq!(status.realtime, cfg!(target_os = "macos"));
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["realtime"],
+            cfg!(target_os = "macos")
+        );
+        runtime.stop();
     }
 
     #[test]

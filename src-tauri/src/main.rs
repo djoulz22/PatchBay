@@ -4,6 +4,7 @@ mod audio;
 mod browser_audio;
 mod engine;
 mod graph;
+mod realtime;
 mod session;
 mod virtual_bus;
 
@@ -22,6 +23,13 @@ struct Routing(Arc<Mutex<Option<Runtime>>>);
 #[tauri::command]
 async fn audio_catalog() -> Result<AudioCatalog, String> {
     tauri::async_runtime::spawn_blocking(audio::enumerate)
+        .await
+        .map_err(engine_error)?
+}
+
+#[tauri::command]
+async fn authorize_audio_input() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(audio::request_microphone)
         .await
         .map_err(engine_error)?
 }
@@ -233,6 +241,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             audio_catalog,
+            authorize_audio_input,
             load_session,
             save_session,
             start_routing,

@@ -74,13 +74,13 @@ Le mode entier utilise la capture d'application Core Audio. La capture par ongle
 
 ### Pistes individuelles d'une visio
 
-La fonctionnalité avancée consiste à détecter les pistes audio distinctes disponibles dans une visio, puis à permettre de choisir lesquelles deviennent des entrées indépendantes. Exemple cible sur un BlackHole 64ch installé.
+La fonctionnalité avancée consiste à détecter les pistes audio distinctes disponibles dans une visio, puis à permettre de choisir lesquelles deviennent des entrées indépendantes. Exemple cible sur une interface Patchbay de 64 entrées.
 
 | Source de la visio | Destination dans le graphe |
 | --- | --- |
-| Participant 1 | BlackHole 64ch, canal 1 |
-| Participant 2 | BlackHole 64ch, canal 2 |
-| Participant 3 | BlackHole 64ch, canal 3 |
+| Participant 1 | Interface Patchbay 64, canal 1 |
+| Participant 2 | Interface Patchbay 64, canal 2 |
+| Participant 3 | Interface Patchbay 64, canal 3 |
 
 - Une piste disponible devient sélectionnable individuellement. Le routage vers un canal, le mixage avec d'autres sources et le monitoring restent libres. L'identité du participant s'affiche quand le service la fournit ou quand l'utilisateur l'associe. À défaut, fournir un libellé de piste que l'utilisateur peut renommer.
 - Distinguer onglet, piste média et personne. Une piste reçue via WebRTC peut transporter une personne, un partage audio ou un mix. Si la visio ne fournit qu'une piste mixée, elle reste disponible comme un seul signal. L'isolation de voix à partir d'un mix constituerait un autre sujet de recherche.
@@ -114,6 +114,8 @@ corepack pnpm test
 cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 corepack pnpm build:app
 ```
+
+`corepack pnpm test` exécute les tests de l'interface, du moteur Rust et du pilote HAL. Le test du pilote charge un bundle temporaire compilé avec AddressSanitizer et UndefinedBehaviorSanitizer.
 
 Pour l'interface, vérifier les tailles usuelles et la taille minimale de 880 × 600, les vrais gestes de câblage, l'inspecteur et la sauvegarde après rechargement. `corepack pnpm dev:web` ouvre un aperçu avec des données de démonstration. `corepack pnpm dev` lance l'application native. Le bundle local se trouve dans `src-tauri/target/release/bundle/macos/Patchbay.app`. Voir aussi le [README](README.md).
 

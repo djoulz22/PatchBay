@@ -5,7 +5,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { FlowCanvas, type FlowProps } from './FlowCanvas'
 import type { Endpoints, Selection } from './model'
 
-const props = defineProps<Pick<FlowProps, 'project' | 'catalog' | 'selection' | 'topologyLocked' | 'meters'>>()
+const props = defineProps<Pick<FlowProps, 'project' | 'catalog' | 'selection' | 'topologyLocked' | 'offline' | 'meters'>>()
 const emit = defineEmits<{
   select: [selection: Selection]
   connect: [endpoints: Endpoints]
@@ -29,7 +29,7 @@ onMounted(() => {
   if (host.value) root = createRoot(host.value)
   renderFlow()
 })
-watch(() => [props.project, props.catalog, props.selection, props.topologyLocked], renderFlow)
+watch(() => [props.project, props.catalog, props.selection, props.topologyLocked, props.offline], renderFlow)
 onBeforeUnmount(() => root?.unmount())
 </script>
 

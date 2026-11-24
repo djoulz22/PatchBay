@@ -39,6 +39,8 @@ Pour reprendre un ancien patch avec un agrégat BlackHole, crée une interface n
 
 macOS 14.2 ou ultérieur, Xcode Command Line Tools, Rust 1.97+, Node 24.22+ et pnpm 11.25 via Corepack.
 
+Vérifie `node --version` avant `corepack pnpm install`. Avec un Node plus ancien, pnpm refuse l'installation.
+
 ```sh
 corepack pnpm install --frozen-lockfile
 corepack pnpm dev
@@ -46,6 +48,8 @@ corepack pnpm typecheck
 corepack pnpm test
 corepack pnpm build:app
 ```
+
+`corepack pnpm test` exécute les tests de l'interface, du moteur Rust et du pilote HAL. Le pilote est testé avec AddressSanitizer et UndefinedBehaviorSanitizer. Pour lancer uniquement ce test, utilise `corepack pnpm test:driver`.
 
 Le bundle local est généré dans `src-tauri/target/release/bundle/macos/Patchbay.app` et signé ad hoc. `corepack pnpm dev:web` ouvre l’aperçu du graphe dans le navigateur sur `127.0.0.1:1432`. Le routage natif passe par l’app Tauri.
 

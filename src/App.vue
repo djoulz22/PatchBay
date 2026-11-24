@@ -8,14 +8,15 @@ import BrowserTabs from './BrowserTabs.vue'
 import GraphCanvas from './GraphCanvas.vue'
 import OutputMixer from './OutputMixer.vue'
 import {
-  audioCatalog, createVirtualBus, deleteVirtualBus, listBrowserTabs, listVirtualBuses, loadSession, native, restartCoreAudio, routingStatus,
+  audioCatalog, authorizeAudioInput, createVirtualBus, deleteVirtualBus, listBrowserTabs, listVirtualBuses, loadSession, native, restartCoreAudio, routingStatus,
   saveSession, startRouting, stopRouting, updateRouting, virtualDriverPath,
 } from './bridge'
 import { MeterStore } from './meters'
 import {
   browserTabFor, canConnectNodes, canInsertOutputChannels, canSource, canTarget, channelCount, channelLabel, channelLevels, dbText, deviceAvailable, deviceFor,
-  emptyCatalog, hasVirtualFeedback, idleStatus, insertOutputChannels, isLegacyVirtualDevice, isMasterChannel, isMixStage,
-  isNativeVirtualDevice, isVirtualDevice, labelFor, newId, newProject, newRoute, rateText,
+  emptyCatalog, hasVirtualFeedback, idleStatus, insertOutputChannels, isLegacyVirtualDevice, isMixStage,
+  isNativeVirtualDevice, isVirtualDevice, labelFor, minimumMixStageChannels, newId, newProject, newRoute,
+  projectNeedsMicrophone, rateText, resizeMixStage as resizeProjectMixStage,
   sourceChannels, starterSession, targetChannels, validConnection, variantFor,
   type AudioCatalog, type BrowserTab, type ChannelLevel, type Endpoints, type GraphNode, type InternalBusKind, type NodeChoice, type NodeKind, type OutputChannelKind, type Project,
   type Route, type SavedGraph, type Selection, type Session, type StereoPair, type VirtualBus, type VirtualBuses,
@@ -121,11 +122,7 @@ const selectedNodeVariant = computed(() => selectedNode.value ? variantFor(selec
 const selectedDevice = computed(() => selectedNode.value ? deviceFor(selectedNode.value.kind, catalog.value) : undefined)
 const selectedBrowserTab = computed(() => selectedNode.value && browserTabFor(selectedNode.value.kind, graphCatalog.value))
 const browserTabChoices = computed(() => browserTabs.value.filter((tab) => tab.id === selectedBrowserTab.value?.id || !assignedTabs.value.has(tab.id)))
-const minimumSelectedChannels = computed(() => selectedNodeRoutes.value.reduce((minimum, route) => {
-  const channel = route.source === selectedNode.value?.id ? route.sourceChannel : route.targetChannel
-  if (isMasterChannel(channel)) return minimum
-  return Math.max(minimum, channel + 1)
-}, 1))
+const minimumSelectedChannels = computed(() => selectedNode.value ? minimumMixStageChannels(project.value, selectedNode.value.id) : 1)
 const usedDeviceIds = computed(() => new Set(session.value?.graphs.flatMap((graph) =>
   graph.project.nodes.flatMap(({ kind }) => kind.type === 'deviceInput' || kind.type === 'deviceOutput' ? [kind.deviceId] : []))))
 const validBusShape = computed(() => [busInputChannels.value, busOutputChannels.value].every((channels) =>
@@ -300,8 +297,10 @@ async function readStatus() {
   try {
     const next = await routingStatus()
     meters.set(next.running ? next.meters : {})
+    if (next.error !== status.value.error) dismissStatusError.value = ''
     // Avoid re-rendering the Vue shell for audio meters that change every poll.
-    if (next.running !== status.value.running || next.error !== status.value.error
+    if (next.running !== status.value.running || next.realtime !== status.value.realtime || next.error !== status.value.error
+      || next.offline.length !== status.value.offline.length || next.offline.some((id, index) => id !== status.value.offline[index])
       || next.underruns !== status.value.underruns || next.droppedFrames !== status.value.droppedFrames) status.value = next
   } catch (cause) {
     if (!disposed) showError(cause)
@@ -321,7 +320,9 @@ async function toggleRouting() {
     if (status.value.running) await stopRouting()
     else {
       await persist()
-      await startRouting(project.value)
+      const currentProject = project.value
+      if (projectNeedsMicrophone(currentProject)) await authorizeAudioInput()
+      await startRouting(currentProject)
     }
   } catch (cause) { showError(cause) }
   finally { await readStatus(); busy.value = false }
@@ -476,30 +477,13 @@ function addOutputChannels() {
 function resizeMixStage(node: GraphNode, event: Event) {
   if (topologyLocked.value || !isMixStage(node.kind)) return
   const input = event.currentTarget as HTMLInputElement
-  const count = input.valueAsNumber
-  if (!Number.isInteger(count) || count < minimumSelectedChannels.value || count > 64) {
+  try {
+    const next = resizeProjectMixStage(project.value, catalog.value, node.id, input.valueAsNumber)
+    if (next !== project.value) setProject(next)
+  } catch (cause) {
     input.value = String(node.kind.channels)
-    showError(count >= 1 && count < minimumSelectedChannels.value
-      ? `Le canal ${minimumSelectedChannels.value} est encore relié. Déconnecte les canaux à retirer avant de réduire le groupe.`
-      : 'Choisis entre 1 et 64 canaux.')
-    return
+    showError(cause)
   }
-  if (count === node.kind.channels) return
-  const kind = { ...node.kind, channels: count }
-  if (kind.type === 'outputChannels') {
-    const stereoPairs = kind.stereoPairs?.filter(([left, right]) => left < count && right < count)
-    kind.levels = kind.levels?.length ? channelLevels(kind) : undefined
-    kind.stereoPairs = stereoPairs?.length ? stereoPairs : undefined
-  }
-  const next = { ...project.value,
-    nodes: nodes.value.map((item) => item.id === node.id ? { ...item, kind } : item),
-  }
-  if (kind.type === 'outputChannels' && hasVirtualFeedback(next, catalog.value)) {
-    input.value = String(node.kind.channels)
-    showError('Ce redimensionnement fermerait une boucle audio par le Master.')
-    return
-  }
-  setProject(next)
 }
 
 function moveNode(id: string, x: number, y: number) {
@@ -899,7 +883,8 @@ onBeforeUnmount(() => {
           </div>
           <div class="canvas-body" @click="menu = false">
             <GraphCanvas v-if="active" :key="active.id" :project="project" :catalog="graphCatalog" :selection="selection"
-              :topology-locked="topologyLocked" :meters="meters" @select="select" @connect="connectFromCanvas" @move="moveNode" @delete="removeSelected" />
+              :topology-locked="topologyLocked" :offline="status.offline" :meters="meters"
+              @select="select" @connect="connectFromCanvas" @move="moveNode" @delete="removeSelected" />
             <div v-if="!loading && active && !nodes.length" class="canvas-empty">
               <div class="empty-icon"><Cable :size="25" /></div>
               <strong>Ton graphe est vide</strong><p>Ajoute une source et relie-la aux canaux de ton mix.</p>
@@ -945,7 +930,7 @@ onBeforeUnmount(() => {
               </label>
               <div v-else class="info-row"><span>Canaux</span><strong>{{ nodeChannels(selectedNode) }}</strong></div>
               <div v-if="selectedDevice" class="info-row"><span>Fréquence du périphérique</span><strong>{{ rateText(selectedDevice.sampleRate) }}</strong></div>
-              <div v-if="!deviceAvailable(selectedNode, graphCatalog)" class="availability-note"><CircleAlert :size="15" />{{ selectedNode.kind.type === 'application' ? 'Application en attente' : selectedNode.kind.type === 'browserTab' ? 'Onglet en attente de capture' : 'Périphérique indisponible' }}</div>
+              <div v-if="status.offline.includes(selectedNode.id) || !deviceAvailable(selectedNode, graphCatalog)" class="availability-note"><CircleAlert :size="15" />{{ selectedNode.kind.type === 'application' ? 'Application en attente' : selectedNode.kind.type === 'browserTab' ? 'Onglet en attente de capture' : 'Périphérique indisponible' }}</div>
               <template v-if="selectedLegacyDevice">
                 <label class="field"><span>Réaffecter à</span>
                   <select :disabled="topologyLocked || !legacyReplacementDevices.length" @change="reassignLegacyDevice">
@@ -1001,8 +986,15 @@ onBeforeUnmount(() => {
                 <p v-if="!destinations.length" class="inspector-note">Ajoute un périphérique virtuel ou une sortie d’écoute.</p>
               </div>
               <p class="inspector-note">Sélectionne un bloc ou un câble pour le régler.</p>
-              <div v-if="status.running && (status.underruns || status.droppedFrames)" class="engine-counters"><Activity :size="15" />
-                <span>{{ status.underruns }} sous-alimentations<br />{{ status.droppedFrames }} trames perdues</span></div>
+              <div v-if="status.running && (!status.realtime || status.underruns || status.droppedFrames)" class="engine-counters">
+                <Activity :size="15" />
+                <span>
+                  <template v-if="!status.realtime">Priorité temps réel indisponible</template>
+                  <template v-if="status.underruns || status.droppedFrames">
+                    <br v-if="!status.realtime" />{{ status.underruns }} sous-alimentations<br />{{ status.droppedFrames }} trames perdues
+                  </template>
+                </span>
+              </div>
             </template>
           </div>
         </aside>

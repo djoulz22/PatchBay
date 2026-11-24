@@ -2404,6 +2404,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
+ "mach2",
  "objc2",
  "objc2-core-audio",
  "objc2-core-audio-types",

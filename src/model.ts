@@ -83,6 +83,8 @@ export interface Meter {
 }
 export interface EngineStatus {
   running: boolean
+  realtime: boolean
+  offline: string[]
   error: string | null
   meters: Record<string, Meter>
   underruns: number
@@ -95,9 +97,14 @@ export type NodeChoice = { label: string; kind: NodeKind; variant: NodeVariant; 
 export type NodeVariant = 'input' | 'system' | 'app' | 'browserTab' | 'tone' | 'internalBus' | 'outputChannels' | 'output' | 'virtual'
 
 export const emptyCatalog: AudioCatalog = { inputs: [], outputs: [], applications: [], systemAudio: false }
-export const idleStatus: EngineStatus = { running: false, error: null, meters: {}, underruns: 0, droppedFrames: 0 }
+export const idleStatus: EngineStatus = { running: false, realtime: false, offline: [], error: null, meters: {}, underruns: 0, droppedFrames: 0 }
 
 export function newProject(): Project { return { sampleRate: 48_000, nodes: [], routes: [] } }
+export function projectNeedsMicrophone(project: Project): boolean {
+  const sources = new Set(project.routes.map(({ source }) => source))
+  return project.nodes.some(({ id, kind }) => kind.type === 'deviceInput' && sources.has(id))
+}
+
 export function channelLevels(kind: OutputChannelKind, count = kind.channels): ChannelLevel[] {
   return Array.from({ length: count }, (_, index) => kind.levels?.[index] ?? { gain: 1, muted: false })
 }
@@ -173,6 +180,14 @@ export function channelCount(node: GraphNode, catalog: AudioCatalog, project: Pr
 
 export function isMasterChannel(channel: number): boolean {
   return channel === MASTER_CHANNELS[0] || channel === MASTER_CHANNELS[1]
+}
+
+export function minimumMixStageChannels(project: Project, nodeId: string): number {
+  return project.routes.reduce((minimum, route) => {
+    const channel = route.source === nodeId ? route.sourceChannel : route.target === nodeId ? route.targetChannel : undefined
+    if (channel === undefined || isMasterChannel(channel)) return minimum
+    return Math.max(minimum, channel + 1)
+  }, 1)
 }
 
 export function sourceChannels(node: GraphNode, catalog: AudioCatalog, project: Project): number[] {
@@ -299,6 +314,30 @@ export function hasVirtualFeedback(project: Project, catalog: AudioCatalog): boo
     }
   }
   return visited < inbound.size
+}
+
+export function resizeMixStage(project: Project, catalog: AudioCatalog, nodeId: string, count: number): Project {
+  const node = project.nodes.find(({ id }) => id === nodeId)
+  if (!node || !isMixStage(node.kind)) return project
+  const minimum = minimumMixStageChannels(project, nodeId)
+  if (!Number.isInteger(count) || count < minimum || count > 64) {
+    throw new Error(count >= 1 && count < minimum
+      ? `Le canal ${minimum} est encore relié. Déconnecte les canaux à retirer avant de réduire le groupe.`
+      : 'Choisis entre 1 et 64 canaux.')
+  }
+  if (count === node.kind.channels) return project
+
+  const kind = { ...node.kind, channels: count }
+  if (kind.type === 'outputChannels') {
+    const stereoPairs = kind.stereoPairs?.filter(([left, right]) => left < count && right < count)
+    kind.levels = kind.levels?.length ? channelLevels(kind) : undefined
+    kind.stereoPairs = stereoPairs?.length ? stereoPairs : undefined
+  }
+  const next = { ...project, nodes: project.nodes.map((item) => item === node ? { ...item, kind } : item) }
+  if (kind.type === 'outputChannels' && hasVirtualFeedback(next, catalog)) {
+    throw new Error('Ce redimensionnement fermerait une boucle audio par le Master.')
+  }
+  return next
 }
 
 function reaches(links: Map<string, string[]>, from: string, to: string): boolean {
