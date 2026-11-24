@@ -50,5 +50,3 @@ corepack pnpm build:app
 Le bundle local est généré dans `src-tauri/target/release/bundle/macos/Patchbay.app` et signé ad hoc. `corepack pnpm dev:web` ouvre l’aperçu du graphe dans le navigateur sur `127.0.0.1:1432`. Le routage natif passe par l’app Tauri.
 
 Le fichier de session est stocké dans `~/Library/Application Support/fr.patchbay.audio/session.json`. La capture audio passe en mémoire et Patchbay n’écrit aucun enregistrement.
-
-Une partie de l’intégration des taps Core Audio provient de TalkTrack sous licence MIT. [Licence TalkTrack](LICENSE-TALKTRACK)

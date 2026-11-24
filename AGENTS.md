@@ -7,7 +7,6 @@ Patchbay est une matrice de routage audio locale pour macOS, inspirée des usage
 - Application autonome en **Rust et Tauri 2**, avec **Vue 3** pour l'interface et l'état métier, et **React Flow** pour le graphe embarqué dans Vue. Le signal audio est traité côté Rust.
 - Interface en français et identité visuelle propre à Patchbay. Employer les termes établis dans l'app, dont **Canaux de sortie**, **Bus interne**, **Interfaces virtuelles** et **Écoute physique**.
 - Cible configurée macOS 14.2 ou ultérieur. Le bundle local a été exécuté sur Apple Silicon. Qualifier les fonctions natives par version de macOS et par matériel avant d'annoncer leur compatibilité.
-- La capture Core Audio par application reprend une partie du travail de TalkTrack. Conserver son attribution et sa [licence MIT](LICENSE-TALKTRACK).
 
 ## Fonctionnalités de la série 0.2
 

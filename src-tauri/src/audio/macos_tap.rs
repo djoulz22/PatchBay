@@ -1,6 +1,4 @@
-//! Private macOS process taps and HAL metadata. Adapted from the TalkTrack audio routing backend.
-
-//! Copyright (c) 2026 ObscureAintSecure. See LICENSE-TALKTRACK.
+//! Private macOS process taps and Core Audio HAL metadata.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
