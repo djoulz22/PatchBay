@@ -30,6 +30,7 @@
     "targets": ["app"],
     "icon": ["icons/icon.png", "icons/icon.icns"],
     "resources": {
+      "../LICENSE": "licenses/Patchbay.txt",
       "../browser-extension/chromium/": "browser-extension/chromium/",
       "target/driver/Patchbay.driver/": "driver/Patchbay.driver/"
     },

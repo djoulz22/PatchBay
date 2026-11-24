@@ -2,6 +2,7 @@
 name = "patchbay"
 version = "0.2.9"
 description = "Patchbay audio Core Audio"
+license = "MIT"
 edition = "2024"
 rust-version = "1.97"
 

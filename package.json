@@ -1,6 +1,7 @@
 {
   "name": "patchbay-desktop",
   "version": "0.2.9",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.25.0",
