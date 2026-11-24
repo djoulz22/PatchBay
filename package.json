@@ -1,0 +1,36 @@
+{
+  "name": "patchbay-desktop",
+  "version": "0.2.9",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "engines": { "node": ">=24.22.1" },
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:web": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:app": "tauri build --bundles app",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "cargo test --locked --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@xyflow/react": "^12.12.1",
+    "lucide-react": "0.577.0",
+    "lucide-vue-next": "^0.577.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.0.0",
+    "vue-tsc": "^3.0.0"
+  }
+}

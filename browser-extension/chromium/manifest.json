@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Patchbay - Capture d'onglet",
+  "description": "Envoie l'audio des onglets choisis à Patchbay sur ce Mac.",
+  "version": "1.0.0",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA71RcHRkqvs8iLt7Zj/6bMa2k4uLaAIFHzsuf1Y+QiC8k1kYJbh1zM3xfY+SrfRGtLic6xifwOeu5VbQtgGaH7E4aR1O+ub6w2JliyojV/KMHPNCg0shFP/IaMFUD2lHUiK32StmAQmbHdrLxTzq0/wlgrvlADHL2Paezd5WII3KmN8nubNuH/ruLUzzpolkS0Fq0kCUekjsYES/U/aQKZyiy5aIRMoD51hUzMGiSgcL2VGENb0XM3wCj79sdWRPSfDvmijY4RDpmCkqThk2FkMyZrYLfbNimdvV2J9GqK/6MPpfC5mviFQQWUncRb0R8CZ7ZzU2xt9dGBob33uvE2wIDAQAB",
+  "permissions": ["activeTab", "tabCapture", "offscreen", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:*"
+  },
+  "background": { "service_worker": "worker.js", "type": "module" },
+  "action": { "default_title": "Envoyer l'onglet à Patchbay" },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
+}
